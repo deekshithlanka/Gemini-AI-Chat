@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Gemini Chat",
+  title: "My Gemini App",
   description: "An elegant chat application powered by Gemini AI",
 };
 
