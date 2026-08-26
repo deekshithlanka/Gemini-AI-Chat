@@ -1,11 +1,49 @@
 import { GoogleGenAI } from "@google/genai";
 import { NextRequest, NextResponse } from "next/server";
+import { isGeminiModelId } from "@/app/lib/models";
 
 export const runtime = "nodejs";
 
+interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+function isChatMessage(value: unknown): value is ChatMessage {
+  if (!value || typeof value !== "object") return false;
+
+  const message = value as Record<string, unknown>;
+  return (
+    (message.role === "user" || message.role === "assistant") &&
+    typeof message.content === "string" &&
+    message.content.trim().length > 0 &&
+    message.content.length <= 10_000
+  );
+}
+
 export async function POST(request: NextRequest) {
   try {
-    const { messages } = await request.json();
+    const body: unknown = await request.json();
+    if (!body || typeof body !== "object") {
+      return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+    }
+
+    const { messages, model } = body as Record<string, unknown>;
+    if (
+      !Array.isArray(messages) ||
+      messages.length === 0 ||
+      messages.length > 100 ||
+      !messages.every(isChatMessage)
+    ) {
+      return NextResponse.json(
+        { error: "Messages must be a non-empty array of valid chat messages" },
+        { status: 400 }
+      );
+    }
+
+    if (!isGeminiModelId(model)) {
+      return NextResponse.json({ error: "Unsupported model" }, { status: 400 });
+    }
 
     const apiKey = process.env.GOOGLE_GENAI_API_KEY;
     if (!apiKey) {
@@ -19,14 +57,14 @@ export async function POST(request: NextRequest) {
 
     // Convert chat messages to Gemini format
     const contents = messages.map(
-      (msg: { role: string; content: string }) => ({
+      (msg) => ({
         role: msg.role === "user" ? "user" : "model",
         parts: [{ text: msg.content }],
       })
     );
 
     const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
+      model,
       contents,
     });
 

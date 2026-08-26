@@ -4,6 +4,24 @@ This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for a diagram and request flow overview.
 
+## Model Selection
+
+The model dropdown in `app/components/Chat.tsx` stores the selected model in
+React state and sends its identifier with every chat request. The API route
+validates that identifier against the shared allowlist in `app/lib/models.ts`
+before passing it to Gemini.
+
+The allowlist is important because data sent by a browser cannot be trusted.
+It prevents callers from requesting models that the application owner has not
+explicitly enabled. The same API route also validates message roles, content,
+length, and conversation size before making a paid model request.
+
+Currently enabled models:
+
+- Gemini 3 Flash Preview
+- Gemini 2.5 Flash
+- Gemini 2.5 Pro
+
 ## Getting Started
 
 First, run the development server:

@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect } from "react";
 import { Menu, Plus, MessageCircle, Settings, HelpCircle } from "lucide-react";
+import { DEFAULT_GEMINI_MODEL, GEMINI_MODELS } from "@/app/lib/models";
 
 interface Message {
   role: "user" | "assistant";
@@ -18,9 +19,11 @@ export default function Chat() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [currentConvId, setCurrentConvId] = useState<string | null>(null);
   const [input, setInput] = useState("");
+  const [selectedModel, setSelectedModel] = useState(DEFAULT_GEMINI_MODEL);
   const [loading, setLoading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const currentConv = conversations.find((c) => c.id === currentConvId);
   const messages = currentConv?.messages || [];
@@ -39,35 +42,47 @@ export default function Chat() {
     setCurrentConvId(newId);
   };
 
+  const handleStop = () => {
+    abortControllerRef.current?.abort();
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!input.trim() || loading) return;
 
-    if (!currentConvId) {
-      startNewChat();
-    }
-
     const convId = currentConvId || Date.now().toString();
     const userMessage: Message = { role: "user", content: input };
 
-    setConversations((prev) =>
-      prev.map((c) =>
-        c.id === convId
-          ? { ...c, messages: [...c.messages, userMessage] }
-          : c
-      )
-    );
+    if (currentConvId) {
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === convId
+            ? { ...c, messages: [...c.messages, userMessage] }
+            : c
+        )
+      );
+    } else {
+      setConversations((prev) => [
+        ...prev,
+        { id: convId, title: "New chat", messages: [userMessage] },
+      ]);
+      setCurrentConvId(convId);
+    }
 
     setInput("");
     setLoading(true);
 
     try {
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           messages: [...messages, userMessage],
+          model: selectedModel,
         }),
+        signal: controller.signal,
       });
 
       if (!response.ok) throw new Error("Failed to fetch response");
@@ -93,6 +108,10 @@ export default function Chat() {
         );
       }
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        return;
+      }
+
       console.error("Error:", error);
       setConversations((prev) =>
         prev.map((c) =>
@@ -111,6 +130,7 @@ export default function Chat() {
         )
       );
     } finally {
+      abortControllerRef.current = null;
       setLoading(false);
     }
   };
@@ -185,7 +205,23 @@ export default function Chat() {
               >
                 <Menu size={20} className="text-gray-700" />
               </button>
-              <h1 className="text-2xl font-semibold text-gray-900">My Gemini App</h1>
+              <div className="flex items-center gap-4">
+  <h1 className="text-2xl font-semibold text-gray-900">My Gemini App</h1>
+
+  <select
+    value={selectedModel}
+    onChange={(event) => setSelectedModel(event.target.value as typeof selectedModel)}
+    disabled={loading}
+    aria-label="Select Gemini model"
+    className="border text-gray-900 rounded-lg px-3 py-2 text-sm disabled:bg-gray-100 disabled:cursor-not-allowed"
+  >
+    {GEMINI_MODELS.map((model) => (
+      <option key={model.id} value={model.id}>
+        {model.label}
+      </option>
+    ))}
+  </select>
+</div>
             </div>
           </div>
         </div>
@@ -272,13 +308,23 @@ export default function Chat() {
                 disabled={loading}
                 className="flex-1 px-4 py-3 border border-gray-300 rounded-full focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder-gray-500 disabled:bg-gray-50 disabled:cursor-not-allowed transition-all bg-white text-gray-900"
               />
-              <button
-                type="submit"
-                disabled={loading || !input.trim()}
-                className="px-6 py-3 bg-blue-600 text-white rounded-full hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors font-medium"
-              >
-                Send
-              </button>
+              {loading ? (
+                <button
+                  type="button"
+                  onClick={handleStop}
+                  className="px-6 py-3 bg-red-600 text-white rounded-full hover:bg-red-700 transition-colors font-medium"
+                >
+                  Stop
+                </button>
+              ) : (
+                <button
+                  type="submit"
+                  disabled={!input.trim()}
+                  className="px-6 py-3 bg-blue-600 text-white rounded-full hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors font-medium"
+                >
+                  Send
+                </button>
+              )}
             </form>
           </div>
         </div>
