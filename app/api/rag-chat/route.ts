@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getRagApiUrl, ragErrorMessage } from "@/app/lib/rag";
+import { getRagApiUrl, ragErrorMessage, ragHeaders } from "@/app/lib/rag";
 import {
   GUARDRAILS_DEFAULT_ON,
   blockedResponseInit,
@@ -8,6 +8,8 @@ import {
 } from "@/app/lib/guardrails";
 
 export const runtime = "nodejs";
+// On Vercel: allow up to 5 minutes (the free plan's maximum) for slow model calls
+export const maxDuration = 300;
 
 interface ChatMessage {
   role: "user" | "assistant";
@@ -40,7 +42,9 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
   }
 
-  const { messages, rerank, guardrails } = (body ?? {}) as Record<string, unknown>;
+  const { messages, rerank, guardrails, retrieval } = (body ?? {}) as Record<string, unknown>;
+  // "vector" = Qdrant hybrid search (+ rerank), "graph" = LightRAG knowledge graph
+  const useGraph = retrieval === "graph";
   if (
     !Array.isArray(messages) ||
     messages.length === 0 ||
@@ -68,13 +72,14 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const response = await fetch(`${ragUrl}/chat`, {
+    const response = await fetch(`${ragUrl}${useGraph ? "/kg/chat" : "/chat"}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: ragHeaders({ "Content-Type": "application/json" }),
       // rerank defaults to true; anything that isn't a boolean is ignored
       body: JSON.stringify({ messages, rerank: typeof rerank === "boolean" ? rerank : true }),
       // Stop the RAG call too when the user presses Stop, and give up after 2 minutes
-      signal: AbortSignal.any([request.signal, AbortSignal.timeout(120_000)]),
+      // Knowledge graph answers can take longer
+      signal: AbortSignal.any([request.signal, AbortSignal.timeout(useGraph ? 180_000 : 120_000)]),
     });
 
     if (!response.ok) {
@@ -101,6 +106,7 @@ export async function POST(request: NextRequest) {
         text,
         sources: Array.isArray(data.sources) ? data.sources : [],
         reranked: data.reranked === true,
+        retrieval: useGraph ? "graph" : "vector",
       },
       { headers: { "X-Guardrails": guarded ? (degraded ? "degraded" : "on") : "off" } }
     );

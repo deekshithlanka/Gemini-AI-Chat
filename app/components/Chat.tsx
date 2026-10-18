@@ -1,7 +1,10 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { Menu, Plus, MessageCircle, Settings, HelpCircle, FileText, Upload, ShieldCheck } from "lucide-react";
+import {
+  Menu, Plus, MessageCircle, Settings, HelpCircle, FileText, Upload, ShieldCheck,
+  Mic, Square, Volume2, LoaderCircle,
+} from "lucide-react";
 import { DEFAULT_GEMINI_MODEL, GEMINI_MODELS } from "@/app/lib/models";
 import type { RagSource } from "@/app/lib/rag";
 
@@ -13,6 +16,7 @@ interface Message {
   content: string;
   sources?: RagSource[]; // pages the answer came from (Document Q&A only)
   reranked?: boolean; // whether those sources were reranked
+  retrieval?: "vector" | "graph"; // which Document Q&A backend answered
   cached?: boolean; // answer came from the response cache
   blocked?: boolean; // user message stopped by guardrails (never sent to the model)
   notice?: boolean; // assistant-side "blocked by ..." notice (not real model output)
@@ -33,11 +37,23 @@ export default function Chat() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [mode, setMode] = useState<Mode>("chat");
   const [rerank, setRerank] = useState(true);
+  const [retrieval, setRetrieval] = useState<"vector" | "graph">("vector");
   const [guardrails, setGuardrails] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [receiving, setReceiving] = useState(false); // true once streamed text starts arriving
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Voice input (speech-to-text)
+  const [recording, setRecording] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+
+  // Read-aloud (text-to-speech)
+  const [speakingIdx, setSpeakingIdx] = useState<number | null>(null);
+  const [ttsLoadingIdx, setTtsLoadingIdx] = useState<number | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
@@ -62,6 +78,88 @@ export default function Chat() {
     abortControllerRef.current?.abort();
   };
 
+  // Mic button: click to start recording, click again to stop and transcribe
+  const toggleRecording = async () => {
+    if (recording) {
+      recorderRef.current?.stop();
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      audioChunksRef.current = [];
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data);
+      };
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop()); // turn the mic off
+        setRecording(false);
+        const blob = new Blob(audioChunksRef.current, { type: recorder.mimeType || "audio/webm" });
+        if (blob.size === 0) return;
+        setTranscribing(true);
+        try {
+          const form = new FormData();
+          form.append("audio", blob, "recording.webm");
+          const response = await fetch("/api/transcribe", { method: "POST", body: form });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || "Transcription failed");
+          // Put the transcript in the box (after anything already typed) so you can edit it
+          if (data.text) setInput((prev) => (prev.trim() ? `${prev.trim()} ${data.text}` : data.text));
+        } catch (error) {
+          alert(error instanceof Error ? error.message : "Transcription failed");
+        } finally {
+          setTranscribing(false);
+        }
+      };
+      recorderRef.current = recorder;
+      recorder.start();
+      setRecording(true);
+    } catch {
+      alert("Microphone access was denied. It only works on localhost or HTTPS.");
+    }
+  };
+
+  const stopSpeaking = () => {
+    audioRef.current?.pause();
+    audioRef.current = null;
+    setSpeakingIdx(null);
+  };
+
+  // Speaker button: read a reply aloud (click again to stop)
+  const handleSpeak = async (idx: number, text: string) => {
+    if (speakingIdx === idx) {
+      stopSpeaking();
+      return;
+    }
+    stopSpeaking(); // only one reply plays at a time
+    setTtsLoadingIdx(idx);
+    try {
+      const response = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.error || "Couldn't generate audio");
+      }
+      const url = URL.createObjectURL(await response.blob());
+      const audio = new Audio(url);
+      audioRef.current = audio;
+      audio.onended = () => {
+        URL.revokeObjectURL(url);
+        if (audioRef.current === audio) setSpeakingIdx(null);
+      };
+      setSpeakingIdx(idx);
+      await audio.play();
+    } catch (error) {
+      alert(error instanceof Error ? error.message : "Couldn't play audio");
+      setSpeakingIdx(null);
+    } finally {
+      setTtsLoadingIdx(null);
+    }
+  };
+
   // Send a PDF to the RAG server so it can be searched
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -73,10 +171,32 @@ export default function Chat() {
     try {
       const form = new FormData();
       form.append("file", file);
+      form.append("retrieval", retrieval);
       const response = await fetch("/api/rag-ingest", { method: "POST", body: form });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Upload failed");
-      setUploadStatus(`✓ Added ${data.filename}: ${data.pages} pages, ${data.chunks} chunks`);
+
+      if (retrieval === "graph") {
+        // Graph building runs in the background: check progress every 3 seconds
+        while (true) {
+          await new Promise((r) => setTimeout(r, 3000));
+          const s = await fetch("/api/rag-ingest").then((r) => r.json());
+          if (s.state === "running") {
+            setUploadStatus(
+              s.total
+                ? `Building knowledge graph from ${s.file}: ${s.done} of ${s.total} pages done...`
+                : `Building knowledge graph from ${s.file}...`
+            );
+          } else if (s.state === "done") {
+            setUploadStatus(`✓ ${s.message}`);
+            break;
+          } else {
+            throw new Error(s.message || s.error || "Knowledge graph build failed");
+          }
+        }
+      } else {
+        setUploadStatus(`✓ Added ${data.filename}: ${data.pages} pages, ${data.chunks} chunks`);
+      }
     } catch (error) {
       setUploadStatus(`✗ ${error instanceof Error ? error.message : "Upload failed"}`);
     } finally {
@@ -122,7 +242,7 @@ export default function Chat() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(
           mode === "docs"
-            ? { messages: history, rerank, guardrails }
+            ? { messages: history, rerank, guardrails, retrieval }
             : { messages: history, model: selectedModel, guardrails }
         ),
         signal: controller.signal,
@@ -184,6 +304,7 @@ export default function Chat() {
           content: data.text,
           sources: notFound ? undefined : data.sources,
           reranked: data.reranked,
+          retrieval: data.retrieval,
         });
       } else {
         // Chat streams: read the answer piece by piece and show it as it arrives
@@ -375,8 +496,20 @@ export default function Chat() {
         disabled={uploading || loading}
         className="flex items-center gap-1 border text-gray-900 rounded-lg px-3 py-2 text-sm hover:bg-gray-100 disabled:bg-gray-100 disabled:cursor-not-allowed"
       >
-        <Upload size={16} /> {uploading ? "Uploading..." : "Upload PDF"}
+        <Upload size={16} /> {uploading ? "Uploading..." : retrieval === "graph" ? "Upload PDF to graph" : "Upload PDF"}
       </button>
+      <select
+        value={retrieval}
+        onChange={(e) => setRetrieval(e.target.value as "vector" | "graph")}
+        disabled={loading || uploading}
+        aria-label="Retrieval method"
+        title="Vector DB: fast, best for specific facts. Knowledge graph: better for questions that connect ideas."
+        className="border text-gray-900 rounded-lg px-3 py-2 text-sm disabled:bg-gray-100"
+      >
+        <option value="vector">Vector DB</option>
+        <option value="graph">Knowledge graph</option>
+      </select>
+      {retrieval === "vector" && (
       <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer select-none" title="Rescore 20 search results and keep the 5 that best answer the question">
         <input
           type="checkbox"
@@ -387,6 +520,7 @@ export default function Chat() {
         />
         Rerank
       </label>
+      )}
     </>
   ) : (
   <select
@@ -473,6 +607,24 @@ export default function Chat() {
                   {msg.blocked && (
                     <p className="mt-1 text-xs text-gray-400">Blocked, not sent to the model</p>
                   )}
+                  {msg.role === "assistant" && !msg.notice && (
+                    <button
+                      type="button"
+                      onClick={() => handleSpeak(idx, msg.content)}
+                      disabled={ttsLoadingIdx !== null && ttsLoadingIdx !== idx}
+                      className="mt-2 p-1 rounded hover:bg-gray-200 text-gray-500 disabled:opacity-40"
+                      title={speakingIdx === idx ? "Stop" : "Read aloud"}
+                      aria-label={speakingIdx === idx ? "Stop reading" : "Read aloud"}
+                    >
+                      {ttsLoadingIdx === idx ? (
+                        <LoaderCircle size={16} className="animate-spin" />
+                      ) : speakingIdx === idx ? (
+                        <Square size={16} />
+                      ) : (
+                        <Volume2 size={16} />
+                      )}
+                    </button>
+                  )}
                   {msg.cached && (
                     <p className="mt-2 text-xs text-gray-400" title="Same question as before, so the saved answer was used instead of calling Gemini">
                       Cached
@@ -480,7 +632,11 @@ export default function Chat() {
                   )}
                   {msg.sources && msg.sources.length > 0 && (
                     <p className="mt-2 text-xs text-gray-500">
-                      {msg.reranked ? "Sources, reranked: " : "Sources, search order: "}
+                      {msg.retrieval === "graph"
+                        ? "Sources, knowledge graph (hybrid): "
+                        : msg.reranked
+                          ? "Sources, reranked: "
+                          : "Sources, search order: "}
                       {msg.sources
                         .map(
                           (s) =>
@@ -528,6 +684,26 @@ export default function Chat() {
                 disabled={loading}
                 className="flex-1 px-4 py-3 border border-gray-300 rounded-full focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder-gray-500 disabled:bg-gray-50 disabled:cursor-not-allowed transition-all bg-white text-gray-900"
               />
+              <button
+                type="button"
+                onClick={toggleRecording}
+                disabled={loading || transcribing}
+                className={`px-4 py-3 rounded-full transition-colors ${
+                  recording
+                    ? "bg-red-600 text-white animate-pulse"
+                    : "bg-gray-100 text-gray-700 hover:bg-gray-200"
+                } disabled:opacity-50 disabled:cursor-not-allowed`}
+                title={recording ? "Stop recording" : "Speak your question"}
+                aria-label={recording ? "Stop recording" : "Start voice input"}
+              >
+                {transcribing ? (
+                  <LoaderCircle size={20} className="animate-spin" />
+                ) : recording ? (
+                  <Square size={20} />
+                ) : (
+                  <Mic size={20} />
+                )}
+              </button>
               {loading ? (
                 <button
                   type="button"

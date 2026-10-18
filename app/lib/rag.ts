@@ -5,6 +5,12 @@ export function getRagApiUrl(): string | null {
   return url ? url.replace(/\/+$/, "") : null;
 }
 
+// Password for the RAG server (RAG_API_KEY, the same value as on Render). Sent on every call.
+export function ragHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  const key = process.env.RAG_API_KEY;
+  return key ? { ...extra, "X-API-Key": key } : extra;
+}
+
 export interface RagSource {
   source: string;
   page: number;

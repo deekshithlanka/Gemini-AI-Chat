@@ -10,6 +10,8 @@ import {
 } from "@/app/lib/guardrails";
 
 export const runtime = "nodejs";
+// On Vercel: allow up to 5 minutes (the free plan's maximum) for slow model calls
+export const maxDuration = 300;
 
 interface ChatMessage {
   role: "user" | "assistant";
