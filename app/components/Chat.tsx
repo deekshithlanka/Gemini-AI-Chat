@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import { DEFAULT_GEMINI_MODEL, GEMINI_MODELS } from "@/app/lib/models";
 import type { RagSource } from "@/app/lib/rag";
+import Markdown from "@/app/components/Markdown";
 
 // "chat" = normal Gemini chat, "docs" = answer from your uploaded PDFs (RAG)
 type Mode = "chat" | "docs";
@@ -596,6 +597,11 @@ export default function Chat() {
                       {msg.content}
                     </p>
                   ) : (
+                    msg.role === "assistant" ? (
+                      <div className="text-gray-900">
+                        <Markdown text={msg.content} />
+                      </div>
+                    ) : (
                     <p
                       className={`leading-relaxed whitespace-pre-wrap ${
                         msg.blocked ? "text-gray-400" : "text-gray-900"
@@ -603,6 +609,7 @@ export default function Chat() {
                     >
                       {msg.content}
                     </p>
+                    )
                   )}
                   {msg.blocked && (
                     <p className="mt-1 text-xs text-gray-400">Blocked, not sent to the model</p>

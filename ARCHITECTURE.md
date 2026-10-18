@@ -1,49 +1,48 @@
-# App Architecture
-
-This app is a small Next.js App Router chat application with a single interactive client surface and one server-side API route.
-
-The editable Draw.io source lives in [ARCHITECTURE.drawio](/Users/bhogaai/my_test_chat_app/ARCHITECTURE.drawio).
-
-## Diagram
+# Architecture
 
 ```mermaid
 flowchart LR
-  U[User in browser] --> P[App Router page<br/>app/page.tsx]
-  P --> L[Root layout<br/>app/layout.tsx]
-  P --> C[Client chat UI<br/>app/components/Chat.tsx]
+  U["User in browser<br/>chat, voice, PDF upload"] --> UI["Next.js app on Vercel<br/>app/components/Chat.tsx"]
+  UI --> API["Next.js API routes (server only)<br/>/api/chat, /api/rag-chat, /api/rag-ingest,<br/>/api/transcribe, /api/tts"]
 
-  C <-->|local state: messages, input, loading| C
-  C -->|POST /api/chat<br/>JSON: { messages }| R[Route handler<br/>app/api/chat/route.ts]
+  API --> GR["Guardrails<br/>Prompt Guard 2 on Groq<br/>+ Gemini safety check"]
+  API --> CA["Response cache<br/>in-memory LRU, 1 hour"]
+  API -->|"Chat mode, voice"| GEM["Google Gemini<br/>chat, transcription, text-to-speech"]
+  API -->|"Documents mode<br/>X-API-Key header"| RAG["RAG server<br/>Python FastAPI on Render"]
 
-  R -->|reads| E[GOOGLE_GENAI_API_KEY<br/>environment variable]
-  R -->|SDK call| G[@google/genai<br/>GoogleGenAI]
-  G -->|generateContent| M[Gemini model<br/>gemini-3-flash-preview]
-  M -->|response text| R
-  R -->|JSON: { text }| C
-
-  L -->|loads global styles + fonts| S[app/globals.css]
+  RAG --> VEC["Vector DB mode<br/>hybrid search: Gemini embeddings + BM25<br/>then cross-encoder rerank, top 5"]
+  RAG --> KG["Knowledge graph mode<br/>LightRAG hybrid query"]
+  VEC --> QD[("Qdrant Cloud<br/>dense + sparse vectors")]
+  KG --> QD
+  KG --> MG[("MongoDB Atlas<br/>graph, documents, cache")]
+  VEC -->|"answer from top chunks only"| GEM
+  KG -->|"entity extraction, answers"| GEM
 ```
 
-## Request Flow
+## Request flows
 
-1. The browser opens `/`, which is rendered by `app/page.tsx`.
-2. `app/page.tsx` returns the `Chat` client component.
-3. `Chat.tsx` manages conversation state in the browser with React hooks.
-4. On submit, the client sends the full message history to `POST /api/chat`.
-5. `app/api/chat/route.ts` runs on the server, reads `GOOGLE_GENAI_API_KEY`, and calls Gemini through `@google/genai`.
-6. The server returns the generated text to the client, which appends it to the message list.
+**Chat mode** (`/api/chat`)
+1. The browser sends the conversation and the selected model.
+2. The route validates every message and checks the model against an allowlist (`app/lib/models.ts`).
+3. Guardrails on: Prompt Guard and the Gemini safety check run in parallel on the latest message. Blocked messages never reach the model.
+4. The response cache is checked (key = model + whole conversation).
+5. Gemini answers. Guardrails off: streamed word by word. Guardrails on: generated in full, checked by the output guard, then sent.
 
-## Key Boundaries
+**Documents mode** (`/api/rag-chat` -> RAG server `/chat` or `/kg/chat`)
+1. Same validation and input guardrails as chat.
+2. The route forwards the question to the RAG server with the `X-API-Key` password.
+3. **Vector DB:** the question is embedded; hybrid search (meaning + keywords) returns 20 chunks; the reranker keeps the 5 that best answer it; Gemini answers only from those, citing pages, or says it couldn't find the answer.
+4. **Knowledge graph:** LightRAG matches entities (local) and themes (global) in the graph built at upload time, and answers with page references. Earlier turns are used, so follow-ups work.
+5. The output guardrail checks the answer; the browser shows it with a Sources line.
 
-- `app/page.tsx` is a server component by default.
-- `app/components/Chat.tsx` is a client component because it uses `useState`, `useRef`, and `useEffect`.
-- `app/api/chat/route.ts` is server-only and keeps the API key out of the browser bundle.
-- `app/layout.tsx` applies the shared document shell, fonts, and metadata.
+**Upload** (`/api/rag-ingest` -> `/ingest` or `/kg/ingest`)
+- Vector DB: PDF -> pages -> 1000-character chunks (150 overlap) -> dense + sparse vectors -> Qdrant.
+- Knowledge graph: runs in the background; Gemini extracts entities and relationships page by page; the browser polls progress.
 
-## Main Files
+**Voice:** `/api/transcribe` (Gemini speech-to-text) and `/api/tts` (Gemini text-to-speech, WAV).
 
-- `app/page.tsx` - entry point for `/`
-- `app/layout.tsx` - root HTML shell and metadata
-- `app/components/Chat.tsx` - interactive chat UI
-- `app/api/chat/route.ts` - Gemini API bridge
-- `app/globals.css` - global styling and theme tokens
+## Security boundaries
+- API keys live only in server environment variables, never in the browser.
+- Every API route validates input; only allowlisted models can be requested.
+- The RAG server rejects requests without the shared `RAG_API_KEY`.
+- Guardrails check user input and model output (retrieved document text is not scanned yet).

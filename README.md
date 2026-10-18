@@ -1,58 +1,68 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Gemini RAG Assistant
+
+Ask questions about your own PDFs and get answers with page citations, protected by guardrails, by text or voice.
+
+**Live:** https://gemini-ai-chat-coral.vercel.app
+**RAG backend repo:** https://github.com/deekshithlanka/rag-backend
+
+## Features
+
+| Feature | What it does |
+|---|---|
+| Chat | Gemini chat with model selection (server-side allowlist), streaming answers, Stop button |
+| Documents mode (RAG) | Upload a PDF, ask questions; answers cite pages and say when the answer isn't in the documents |
+| Hybrid search + reranking | Meaning + keyword search finds 20 chunks; a cross-encoder keeps the best 5, scored 0-1 |
+| Knowledge graph | LightRAG graph of entities and relationships for questions that connect ideas |
+| Guardrails | Prompt Guard 2 (jailbreak / prompt injection) and a Gemini safety check on input and output |
+| Response cache | Repeated questions answered instantly (Cached label) |
+| Voice | Speech-to-text input and read-aloud answers |
 
 ## Architecture
 
-See [ARCHITECTURE.md](./ARCHITECTURE.md) for a diagram and request flow overview.
-
-## Model Selection
-
-The model dropdown in `app/components/Chat.tsx` stores the selected model in
-React state and sends its identifier with every chat request. The API route
-validates that identifier against the shared allowlist in `app/lib/models.ts`
-before passing it to Gemini.
-
-The allowlist is important because data sent by a browser cannot be trusted.
-It prevents callers from requesting models that the application owner has not
-explicitly enabled. The same API route also validates message roles, content,
-length, and conversation size before making a paid model request.
-
-Currently enabled models:
-
-- Gemini 3 Flash Preview
-- Gemini 2.5 Flash
-- Gemini 2.5 Pro
-
-## Getting Started
-
-First, run the development server:
-
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+```mermaid
+flowchart LR
+  U["User in browser"] --> UI["Next.js app on Vercel"]
+  UI --> API["API routes<br/>validation, guardrails, cache"]
+  API -->|"Chat, voice"| GEM["Google Gemini"]
+  API -->|"Documents"| RAG["RAG server<br/>FastAPI on Render"]
+  RAG --> QD[("Qdrant Cloud<br/>vectors")]
+  RAG --> MG[("MongoDB Atlas<br/>knowledge graph")]
+  RAG --> GEM
+  API --> GQ["Groq<br/>Prompt Guard"]
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Full diagram and request flows: [ARCHITECTURE.md](ARCHITECTURE.md).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Tech stack
+Next.js (React, TypeScript, Tailwind) · Google Gemini (`@google/genai`) · Groq · Python FastAPI · LangChain · Qdrant · LightRAG · MongoDB Atlas · fastembed · Vercel · Render
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Run locally
 
-## Learn More
+```bash
+npm install
+cp .env.local.example .env.local   # fill in the keys below
+npm run dev                        # http://localhost:3000
+```
 
-To learn more about Next.js, take a look at the following resources:
+| Variable | Purpose |
+|---|---|
+| `GOOGLE_GENAI_API_KEY` | Gemini (chat, safety check, voice) |
+| `GROQ_API_KEY` | Prompt Guard guardrail (optional; skipped if missing) |
+| `RAG_API_URL` | RAG server, e.g. `http://localhost:8001` or the Render URL |
+| `RAG_API_KEY` | Password for the RAG server (only if it has one set) |
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Documents mode needs the [rag-backend](https://github.com/deekshithlanka/rag-backend) server running.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Project structure
+- `app/components/Chat.tsx`: chat UI (modes, upload, rerank, guardrails, voice, sources)
+- `app/components/Markdown.tsx`: renders formatted answers
+- `app/api/chat/route.ts`: Gemini chat with guardrails, cache, streaming
+- `app/api/rag-chat/route.ts`, `app/api/rag-ingest/route.ts`: proxy to the RAG server
+- `app/api/transcribe/route.ts`, `app/api/tts/route.ts`: voice
+- `app/lib/guardrails.ts`, `app/lib/responseCache.ts`, `app/lib/models.ts`, `app/lib/rag.ts`
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Known limitations
+- Free Render server sleeps after 15 minutes idle (first request about 1 minute).
+- The cache is per server instance on Vercel.
+- Uploads over about 4 MB exceed Vercel's request size limit.
+- Retrieved document text is not scanned for prompt injection yet.
