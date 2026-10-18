@@ -1,12 +1,17 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { Menu, Plus, MessageCircle, Settings, HelpCircle } from "lucide-react";
+import { Menu, Plus, MessageCircle, Settings, HelpCircle, FileText, Upload } from "lucide-react";
 import { DEFAULT_GEMINI_MODEL, GEMINI_MODELS } from "@/app/lib/models";
+import type { RagSource } from "@/app/lib/rag";
+
+// "chat" = normal Gemini chat, "docs" = answer from your uploaded PDFs (RAG)
+type Mode = "chat" | "docs";
 
 interface Message {
   role: "user" | "assistant";
   content: string;
+  sources?: RagSource[]; // pages the answer came from (Document Q&A only)
 }
 
 interface Conversation {
@@ -22,6 +27,10 @@ export default function Chat() {
   const [selectedModel, setSelectedModel] = useState(DEFAULT_GEMINI_MODEL);
   const [loading, setLoading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [mode, setMode] = useState<Mode>("chat");
+  const [uploading, setUploading] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
@@ -44,6 +53,28 @@ export default function Chat() {
 
   const handleStop = () => {
     abortControllerRef.current?.abort();
+  };
+
+  // Send a PDF to the RAG server so it can be searched
+  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // allow picking the same file again later
+    if (!file) return;
+
+    setUploading(true);
+    setUploadStatus(`Adding ${file.name}... (embedding can take a minute)`);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const response = await fetch("/api/rag-ingest", { method: "POST", body: form });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Upload failed");
+      setUploadStatus(`✓ Added ${data.filename}: ${data.pages} pages, ${data.chunks} chunks`);
+    } catch (error) {
+      setUploadStatus(`✗ ${error instanceof Error ? error.message : "Upload failed"}`);
+    } finally {
+      setUploading(false);
+    }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -75,22 +106,26 @@ export default function Chat() {
     try {
       const controller = new AbortController();
       abortControllerRef.current = controller;
-      const response = await fetch("/api/chat", {
+      // Send only role + content (not sources) to the server
+      const history = [...messages, userMessage].map(({ role, content }) => ({ role, content }));
+      const response = await fetch(mode === "docs" ? "/api/rag-chat" : "/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          messages: [...messages, userMessage],
-          model: selectedModel,
-        }),
+        body: JSON.stringify(
+          mode === "docs" ? { messages: history } : { messages: history, model: selectedModel }
+        ),
         signal: controller.signal,
       });
 
-      if (!response.ok) throw new Error("Failed to fetch response");
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || "Failed to fetch response");
 
-      const data = await response.json();
+      // Don't show sources when the documents didn't contain the answer
+      const notFound = typeof data.text === "string" && data.text.includes("couldn't find that");
       const assistantMessage: Message = {
         role: "assistant",
         content: data.text,
+        sources: mode === "docs" && !notFound ? data.sources : undefined,
       };
 
       setConversations((prev) =>
@@ -122,7 +157,9 @@ export default function Chat() {
                   ...c.messages,
                   {
                     role: "assistant",
-                    content: "Sorry, I encountered an error. Please try again.",
+                    content: `Sorry, something went wrong: ${
+                      error instanceof Error ? error.message : "please try again."
+                    }`,
                   },
                 ],
               }
@@ -135,12 +172,20 @@ export default function Chat() {
     }
   };
 
-  const suggestedPrompts = [
-    "Explain quantum computing",
-    "Write a Python function",
-    "Plan a trip to Japan",
-    "Summarize a topic",
-  ];
+  const suggestedPrompts =
+    mode === "docs"
+      ? [
+          "Summarize the main points",
+          "What are the key numbers mentioned?",
+          "What risks or problems are described?",
+          "List the main topics covered",
+        ]
+      : [
+          "Explain quantum computing",
+          "Write a Python function",
+          "Plan a trip to Japan",
+          "Summarize a topic",
+        ];
 
   return (
     <div className="flex h-screen bg-gradient-to-br from-blue-100 via-blue-50 to-white">
@@ -208,6 +253,39 @@ export default function Chat() {
               <div className="flex items-center gap-4">
   <h1 className="text-2xl font-semibold text-gray-900">My Gemini App</h1>
 
+  {/* Mode switch */}
+  <div className="flex rounded-lg border border-gray-300 overflow-hidden text-sm" role="group" aria-label="Mode">
+    <button
+      type="button"
+      onClick={() => setMode("chat")}
+      disabled={loading}
+      className={`flex items-center gap-1 px-3 py-2 ${mode === "chat" ? "bg-blue-600 text-white" : "bg-white text-gray-700 hover:bg-gray-100"}`}
+    >
+      <MessageCircle size={16} /> Chat
+    </button>
+    <button
+      type="button"
+      onClick={() => setMode("docs")}
+      disabled={loading}
+      className={`flex items-center gap-1 px-3 py-2 ${mode === "docs" ? "bg-blue-600 text-white" : "bg-white text-gray-700 hover:bg-gray-100"}`}
+    >
+      <FileText size={16} /> Documents
+    </button>
+  </div>
+
+  {mode === "docs" ? (
+    <>
+      <input ref={fileInputRef} type="file" accept="application/pdf,.pdf" onChange={handleUpload} className="hidden" />
+      <button
+        type="button"
+        onClick={() => fileInputRef.current?.click()}
+        disabled={uploading || loading}
+        className="flex items-center gap-1 border text-gray-900 rounded-lg px-3 py-2 text-sm hover:bg-gray-100 disabled:bg-gray-100 disabled:cursor-not-allowed"
+      >
+        <Upload size={16} /> {uploading ? "Uploading..." : "Upload PDF"}
+      </button>
+    </>
+  ) : (
   <select
     value={selectedModel}
     onChange={(event) => setSelectedModel(event.target.value as typeof selectedModel)}
@@ -221,10 +299,15 @@ export default function Chat() {
       </option>
     ))}
   </select>
+  )}
 </div>
             </div>
           </div>
         </div>
+
+        {mode === "docs" && uploadStatus && (
+          <div className="max-w-4xl mx-auto w-full px-4 pt-3 text-sm text-gray-700">{uploadStatus}</div>
+        )}
 
         {/* Messages */}
         <div className="flex-1 overflow-y-auto">
@@ -232,7 +315,11 @@ export default function Chat() {
             {messages.length === 0 && (
               <div className="flex flex-col items-center justify-center h-full min-h-[400px]">
                 <h2 className="text-3xl font-semibold text-gray-900 mb-2">Hello there</h2>
-                <p className="text-gray-600 mb-8">How can I help you today?</p>
+                <p className="text-gray-600 mb-8">
+                  {mode === "docs"
+                    ? "Ask a question about your uploaded PDFs"
+                    : "How can I help you today?"}
+                </p>
 
                 <div className="grid grid-cols-2 gap-3 w-full max-w-2xl">
                   {suggestedPrompts.map((prompt) => (
@@ -270,6 +357,12 @@ export default function Chat() {
                   <p className="text-gray-900 leading-relaxed whitespace-pre-wrap">
                     {msg.content}
                   </p>
+                  {msg.sources && msg.sources.length > 0 && (
+                    <p className="mt-2 text-xs text-gray-500">
+                      Sources:{" "}
+                      {msg.sources.map((s) => `${s.source} p. ${s.page}`).join(" · ")}
+                    </p>
+                  )}
                 </div>
                 {msg.role === "user" && (
                   <div className="flex-shrink-0 w-8 h-8 rounded-full bg-gradient-to-br from-green-400 to-green-600 flex items-center justify-center text-white font-semibold text-lg">
@@ -304,7 +397,7 @@ export default function Chat() {
                 type="text"
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
-                placeholder="Message Gemini"
+                placeholder={mode === "docs" ? "Ask about your documents" : "Message Gemini"}
                 disabled={loading}
                 className="flex-1 px-4 py-3 border border-gray-300 rounded-full focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder-gray-500 disabled:bg-gray-50 disabled:cursor-not-allowed transition-all bg-white text-gray-900"
               />
