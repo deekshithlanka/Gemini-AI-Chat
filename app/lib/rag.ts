@@ -8,6 +8,8 @@ export function getRagApiUrl(): string | null {
 export interface RagSource {
   source: string;
   page: number;
+  score?: number; // reranker relevance (or search score when rerank is off)
+  chunks?: number; // how many of the retrieved chunks came from this page
 }
 
 // Turn the RAG server's error into a short message for the user.

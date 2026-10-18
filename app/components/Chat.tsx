@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { Menu, Plus, MessageCircle, Settings, HelpCircle, FileText, Upload } from "lucide-react";
+import { Menu, Plus, MessageCircle, Settings, HelpCircle, FileText, Upload, ShieldCheck } from "lucide-react";
 import { DEFAULT_GEMINI_MODEL, GEMINI_MODELS } from "@/app/lib/models";
 import type { RagSource } from "@/app/lib/rag";
 
@@ -12,6 +12,10 @@ interface Message {
   role: "user" | "assistant";
   content: string;
   sources?: RagSource[]; // pages the answer came from (Document Q&A only)
+  reranked?: boolean; // whether those sources were reranked
+  cached?: boolean; // answer came from the response cache
+  blocked?: boolean; // user message stopped by guardrails (never sent to the model)
+  notice?: boolean; // assistant-side "blocked by ..." notice (not real model output)
 }
 
 interface Conversation {
@@ -28,7 +32,10 @@ export default function Chat() {
   const [loading, setLoading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [mode, setMode] = useState<Mode>("chat");
+  const [rerank, setRerank] = useState(true);
+  const [guardrails, setGuardrails] = useState(true);
   const [uploading, setUploading] = useState(false);
+  const [receiving, setReceiving] = useState(false); // true once streamed text starts arriving
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -106,35 +113,101 @@ export default function Chat() {
     try {
       const controller = new AbortController();
       abortControllerRef.current = controller;
-      // Send only role + content (not sources) to the server
-      const history = [...messages, userMessage].map(({ role, content }) => ({ role, content }));
+      // Send only role + content, and leave out blocked messages and guardrail notices
+      const history = [...messages, userMessage]
+        .filter((m) => !m.blocked && !m.notice)
+        .map(({ role, content }) => ({ role, content }));
       const response = await fetch(mode === "docs" ? "/api/rag-chat" : "/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(
-          mode === "docs" ? { messages: history } : { messages: history, model: selectedModel }
+          mode === "docs"
+            ? { messages: history, rerank, guardrails }
+            : { messages: history, model: selectedModel, guardrails }
         ),
         signal: controller.signal,
       });
 
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || "Failed to fetch response");
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.error || "Failed to fetch response");
+      }
 
-      // Don't show sources when the documents didn't contain the answer
-      const notFound = typeof data.text === "string" && data.text.includes("couldn't find that");
-      const assistantMessage: Message = {
-        role: "assistant",
-        content: data.text,
-        sources: mode === "docs" && !notFound ? data.sources : undefined,
-      };
+      // Guardrails blocked the question or the answer
+      if (response.headers.get("X-Guardrails-Blocked")) {
+        const data = await response.json();
+        const b = data.blocked ?? {};
+        setConversations((prev) =>
+          prev.map((c) => {
+            if (c.id !== convId) return c;
+            const msgs = [...c.messages];
+            // Mark the user's message as blocked (it stays visible but is never sent again)
+            for (let i = msgs.length - 1; i >= 0; i--) {
+              if (msgs[i].role === "user") {
+                msgs[i] = { ...msgs[i], blocked: true };
+                break;
+              }
+            }
+            const what = b.stage === "output" ? "The reply was blocked" : "Your message was blocked";
+            msgs.push({
+              role: "assistant",
+              notice: true,
+              content: `${what} by ${b.guard ?? "guardrails"}: ${b.reason ?? "unsafe content"}`,
+            });
+            return { ...c, messages: msgs };
+          })
+        );
+        return;
+      }
 
-      setConversations((prev) =>
-        prev.map((c) =>
-          c.id === convId
-            ? { ...c, messages: [...c.messages, assistantMessage] }
-            : c
-        )
-      );
+      const addAssistant = (msg: Message) =>
+        setConversations((prev) =>
+          prev.map((c) => (c.id === convId ? { ...c, messages: [...c.messages, msg] } : c))
+        );
+      const updateLastMessage = (content: string) =>
+        setConversations((prev) =>
+          prev.map((c) => {
+            if (c.id !== convId) return c;
+            const msgs = [...c.messages];
+            msgs[msgs.length - 1] = { ...msgs[msgs.length - 1], content };
+            return { ...c, messages: msgs };
+          })
+        );
+
+      if (mode === "docs") {
+        // Document Q&A returns the whole answer at once, with sources
+        const data = await response.json();
+        // Don't show sources when the documents didn't contain the answer
+        const notFound = typeof data.text === "string" && data.text.includes("couldn't find that");
+        addAssistant({
+          role: "assistant",
+          content: data.text,
+          sources: notFound ? undefined : data.sources,
+          reranked: data.reranked,
+        });
+      } else {
+        // Chat streams: read the answer piece by piece and show it as it arrives
+        const cached = response.headers.get("X-Cache") === "HIT";
+        const reader = response.body!.getReader();
+        const decoder = new TextDecoder();
+        let text = "";
+        let started = false;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          text += decoder.decode(value, { stream: true });
+          if (!started) {
+            started = true;
+            setReceiving(true);
+            addAssistant({ role: "assistant", content: text, cached });
+          } else {
+            updateLastMessage(text);
+          }
+        }
+        text += decoder.decode();
+        if (started) updateLastMessage(text);
+        else addAssistant({ role: "assistant", content: "No response generated" });
+      }
 
       if (messages.length === 0) {
         const title = userMessage.content.substring(0, 30) + (userMessage.content.length > 30 ? "..." : "");
@@ -169,6 +242,7 @@ export default function Chat() {
     } finally {
       abortControllerRef.current = null;
       setLoading(false);
+      setReceiving(false);
     }
   };
 
@@ -227,6 +301,20 @@ export default function Chat() {
         </div>
 
         <div className="p-3 border-t border-gray-200 space-y-2">
+          <label
+            className="w-full flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-gray-100 text-gray-600 text-sm cursor-pointer select-none"
+            title="Check every message and reply for jailbreaks and unsafe content. Turns off streaming while on."
+          >
+            <ShieldCheck size={18} />
+            <span className="flex-1">Guardrails</span>
+            <input
+              type="checkbox"
+              checked={guardrails}
+              onChange={(e) => setGuardrails(e.target.checked)}
+              disabled={loading}
+              className="w-4 h-4 accent-blue-600"
+            />
+          </label>
           <button className="w-full text-left flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-gray-100 text-gray-600 text-sm transition-colors">
             <HelpCircle size={18} />
             Help & FAQ
@@ -252,6 +340,11 @@ export default function Chat() {
               </button>
               <div className="flex items-center gap-4">
   <h1 className="text-2xl font-semibold text-gray-900">My Gemini App</h1>
+  {guardrails && (
+    <span className="flex items-center gap-1 rounded-full bg-green-100 text-green-800 px-2 py-1 text-xs font-medium">
+      <ShieldCheck size={14} /> Guarded
+    </span>
+  )}
 
   {/* Mode switch */}
   <div className="flex rounded-lg border border-gray-300 overflow-hidden text-sm" role="group" aria-label="Mode">
@@ -284,6 +377,16 @@ export default function Chat() {
       >
         <Upload size={16} /> {uploading ? "Uploading..." : "Upload PDF"}
       </button>
+      <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer select-none" title="Rescore 20 search results and keep the 5 that best answer the question">
+        <input
+          type="checkbox"
+          checked={rerank}
+          onChange={(e) => setRerank(e.target.checked)}
+          disabled={loading}
+          className="w-4 h-4 accent-blue-600"
+        />
+        Rerank
+      </label>
     </>
   ) : (
   <select
@@ -354,13 +457,37 @@ export default function Chat() {
                       : "text-left"
                   }`}
                 >
-                  <p className="text-gray-900 leading-relaxed whitespace-pre-wrap">
-                    {msg.content}
-                  </p>
+                  {msg.notice ? (
+                    <p className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-amber-900 text-sm">
+                      {msg.content}
+                    </p>
+                  ) : (
+                    <p
+                      className={`leading-relaxed whitespace-pre-wrap ${
+                        msg.blocked ? "text-gray-400" : "text-gray-900"
+                      }`}
+                    >
+                      {msg.content}
+                    </p>
+                  )}
+                  {msg.blocked && (
+                    <p className="mt-1 text-xs text-gray-400">Blocked, not sent to the model</p>
+                  )}
+                  {msg.cached && (
+                    <p className="mt-2 text-xs text-gray-400" title="Same question as before, so the saved answer was used instead of calling Gemini">
+                      Cached
+                    </p>
+                  )}
                   {msg.sources && msg.sources.length > 0 && (
                     <p className="mt-2 text-xs text-gray-500">
-                      Sources:{" "}
-                      {msg.sources.map((s) => `${s.source} p. ${s.page}`).join(" · ")}
+                      {msg.reranked ? "Sources, reranked: " : "Sources, search order: "}
+                      {msg.sources
+                        .map(
+                          (s) =>
+                            `${s.source} p. ${s.page}` +
+                            (s.score !== undefined ? ` (${s.score.toFixed(2)}${s.chunks && s.chunks > 1 ? `, ×${s.chunks}` : ""})` : "")
+                        )
+                        .join(" · ")}
                     </p>
                   )}
                 </div>
@@ -372,7 +499,7 @@ export default function Chat() {
               </div>
             ))}
 
-            {loading && (
+            {loading && !receiving && (
               <div className="flex gap-4 py-6 animate-in fade-in">
                 <div className="flex-shrink-0 w-8 h-8 rounded-full bg-gradient-to-br from-blue-400 to-blue-600 flex items-center justify-center text-white font-semibold text-lg">
                   🤖

@@ -1,5 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getRagApiUrl, ragErrorMessage } from "@/app/lib/rag";
+import {
+  GUARDRAILS_DEFAULT_ON,
+  blockedResponseInit,
+  checkInput,
+  checkOutput,
+} from "@/app/lib/guardrails";
 
 export const runtime = "nodejs";
 
@@ -34,7 +40,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
   }
 
-  const { messages } = (body ?? {}) as Record<string, unknown>;
+  const { messages, rerank, guardrails } = (body ?? {}) as Record<string, unknown>;
   if (
     !Array.isArray(messages) ||
     messages.length === 0 ||
@@ -47,11 +53,26 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  // Input guardrails before anything reaches the RAG server
+  const guarded = typeof guardrails === "boolean" ? guardrails : GUARDRAILS_DEFAULT_ON;
+  const lastUser =
+    [...(messages as { role: string; content: string }[])].reverse().find((m) => m.role === "user")
+      ?.content ?? "";
+  let degraded = false;
+  if (guarded) {
+    const input = await checkInput(lastUser);
+    degraded = input.degraded;
+    if (input.block) {
+      return NextResponse.json({ blocked: input.block }, blockedResponseInit(input.block, degraded));
+    }
+  }
+
   try {
     const response = await fetch(`${ragUrl}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messages }),
+      // rerank defaults to true; anything that isn't a boolean is ignored
+      body: JSON.stringify({ messages, rerank: typeof rerank === "boolean" ? rerank : true }),
       // Stop the RAG call too when the user presses Stop, and give up after 2 minutes
       signal: AbortSignal.any([request.signal, AbortSignal.timeout(120_000)]),
     });
@@ -64,10 +85,25 @@ export async function POST(request: NextRequest) {
     }
 
     const data = await response.json();
-    return NextResponse.json({
-      text: typeof data.text === "string" ? data.text : "No answer returned",
-      sources: Array.isArray(data.sources) ? data.sources : [],
-    });
+    const text = typeof data.text === "string" ? data.text : "No answer returned";
+
+    // Output guardrail: check the answer before the browser sees it
+    if (guarded) {
+      const output = await checkOutput(lastUser, text);
+      degraded = degraded || output.degraded;
+      if (output.block) {
+        return NextResponse.json({ blocked: output.block }, blockedResponseInit(output.block, degraded));
+      }
+    }
+
+    return NextResponse.json(
+      {
+        text,
+        sources: Array.isArray(data.sources) ? data.sources : [],
+        reranked: data.reranked === true,
+      },
+      { headers: { "X-Guardrails": guarded ? (degraded ? "degraded" : "on") : "off" } }
+    );
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") {
       return NextResponse.json({ error: "Request cancelled" }, { status: 499 });
